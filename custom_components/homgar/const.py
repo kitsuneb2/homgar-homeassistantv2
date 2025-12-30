@@ -11,8 +11,8 @@ CONF_PASSWORD: Final = "password"
 CONF_AREA_CODE: Final = "area_code"
 
 # Default values
-DEFAULT_AREA_CODE: Final = "31"
-DEFAULT_UPDATE_INTERVAL: Final = 30  # seconds
+DEFAULT_AREA_CODE: Final = "33"
+DEFAULT_UPDATE_INTERVAL: Final = 60  # seconds
 
 # API
 API_BASE_URL: Final = "https://region3.homgarus.com"
