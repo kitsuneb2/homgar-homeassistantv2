@@ -6,6 +6,16 @@ logger = logging.getLogger(__name__)
 
 STATS_VALUE_REGEX = re.compile(r'^(\d+)\((\d+)/(\d+)/(\d+)\)')
 
+def _safe_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.split("(")[0]
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
 
 def _parse_stats_value(s):
     if match := STATS_VALUE_REGEX.fullmatch(s):
@@ -108,10 +118,10 @@ class HomgarHubDevice(HomgarDevice):
     A hub acts as a gateway for sensors and actuators (subdevices).
     A home contains an arbitrary number of hubs, each of which contains an arbitrary number of subdevices.
     """
-    def __init__(self, subdevices, hub_device_name=None, hub_product_key=None, **kwargs):
+    def __init__(self, subdevices=None, hub_device_name=None, hub_product_key=None, **kwargs):
         super().__init__(**kwargs)
         self.address = 1
-        self.subdevices = subdevices
+        self.subdevices = subdevices or []
         self.hub_device_name = hub_device_name
         self.hub_product_key = hub_product_key
 
@@ -731,7 +741,68 @@ class HWG0538WRF(HomgarHubDevice):
         """
         pass
 
+class HomgarWeatherHub(HomgarHubDevice):
+    MODEL_CODES = [257]
+    FRIENDLY_DESC = "HomGar Weather Hub (HG01)"
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.temp_mk_current = None
+        self.hum_current = None
+        self.press_pa_current = None
+
+    def get_device_status_ids(self):
+        return ["connected", "state"]
+    # ❗ PAS de parsing ici
+    
+
+class HomgarWeatherStation(HomgarSubDevice):
+    MODEL_CODES = [85]
+    FRIENDLY_DESC = "HomGar Weather Station"
+
+    def get_device_status_ids(self):
+        return ["connected", "state", "D01"]
+
+    def _parse_device_specific_status_d_value(self, s):
+        logger.debug("RAW D01 FROM HUB = %s", s)
+
+        try:
+            temp_str, hum_str, press_str, *_ = s.split(',')
+
+            t, *_ = _parse_stats_value(temp_str)
+            self.temp_mk_current = _temp_to_mk(t) if t is not None else None
+
+            h, *_ = _parse_stats_value(hum_str)
+            self.hum_current = _safe_int(h)
+
+            # Pression (ex: "P=10070(10080/10060/1)")
+            if press_str.startswith("P="):
+                press_str = press_str[2:]
+
+            p, *_ = _parse_stats_value(press_str)
+            self.press_pa_current = _safe_int(p)
+
+        except Exception as e:
+            logger.debug("Error parsing D01 payload '%s': %s", s, e)
+
+
+class HomgarIndoorSensor(HomgarSubDevice):
+    MODEL_CODES = [86]
+    FRIENDLY_DESC = "HomGar Indoor Sensor"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.temp_mk_current = None
+        self.hum_current = None
+
+    def _parse_device_specific_status_d_value(self, s):
+        temp_str, hum_str, *_ = s.split(',')
+
+        t, *_ = _parse_stats_value(temp_str)
+        self.temp_mk_current = _temp_to_mk(t) if t is not None else None
+
+        h, *_ = _parse_stats_value(hum_str)
+        self.hum_current = _safe_int(h)
 
 MODEL_CODE_MAPPING = {
     code: clazz
@@ -742,6 +813,9 @@ MODEL_CODE_MAPPING = {
         RainPointAirSensor,
         RainPoint2ZoneTimer,
         DiivooWT11W,
-        HWG0538WRF
+        HWG0538WRF,
+        HomgarWeatherHub,
+        HomgarWeatherStation,
+        HomgarIndoorSensor
     ) for code in clazz.MODEL_CODES
 }
