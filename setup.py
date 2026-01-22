@@ -7,7 +7,7 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="BRS",
-    author_email="kitsune.b2@gmail.com",
+    author_email="kitsune.brs2@gmail.com",
     url="https://github.com/kitsuneb2/homgar-homeassistantv2",
     packages=find_packages(),
     install_requires=[
