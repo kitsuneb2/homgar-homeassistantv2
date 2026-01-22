@@ -1,9 +1,12 @@
 import binascii
 import hashlib
+import hmac
 import os
 import json
 import threading
 import uuid
+import logging
+import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Callable
 
@@ -18,7 +21,6 @@ from .logutil import TRACE, get_logger
 
 logger = get_logger(__file__)
 
-
 class HomgarApiException(Exception):
     def __init__(self, code, msg):
         super().__init__()
@@ -31,7 +33,6 @@ class HomgarApiException(Exception):
             s += f" ('{self.msg}')"
         return s
 
-
 class HomgarApi:
     def __init__(
             self,
@@ -39,14 +40,6 @@ class HomgarApi:
             api_base_url: str = "https://region3.homgarus.com",
             requests_session: requests.Session = None
     ):
-        """
-        Create an object for interacting with the Homgar API
-        :param auth_cache: A dictionary in which authentication information will be stored.
-            Save this dict on exit and supply it again next time constructing this object to avoid logging in
-            if a valid token is still present.
-        :param api_base_url: The base URL for the Homgar API. Omit trailing slash.
-        :param requests_session: Optional requests lib session to use. New session is created if omitted.
-        """
         self.session = requests_session or requests.Session()
         self.cache = auth_cache or {}
         self.base = api_base_url
@@ -57,14 +50,15 @@ class HomgarApi:
         self._mqtt_lock = threading.Lock()
         self._subscription_devices = []
         self._subscription_hids = []
+        self._api_cmd_counter = 0
+        self._mqtt_msg_counter = 0
 
     def _request(self, method, url, with_auth=True, headers=None, **kwargs):
-        logger.log(TRACE, "%s %s %s", method, url, kwargs)
         headers = {"lang": "en", "appCode": "1", **(headers or {})}
         if with_auth:
-            headers["auth"] = self.cache["token"]
+            headers["auth"] = self.cache.get("token")
         response = self.session.request(method, url, headers=headers, **kwargs)
-        logger.log(TRACE, "-[%03d]-> %s", response.status_code, response.text)
+        logger.debug("[API HTTP RECV] Status: %d | URL: %s", response.status_code, url)
         return response
 
     def _request_json(self, method, path, **kwargs):
@@ -78,27 +72,18 @@ class HomgarApi:
         return self._request_json("GET", path, **kwargs)
 
     def _get_push_product_key(self) -> str:
-        """Get product key for push notifications. This should be obtained from API or device configuration."""
-        # In a real implementation, this would be fetched from the API response or device configuration
-        # This is a placeholder - the actual key should come from the server response
-        # or be configurable through the integration setup
         return "push_product_key_placeholder"
     
     def _post_json(self, path, body, **kwargs):
         return self._request_json("POST", path, json=body, **kwargs)
 
     def login(self, email: str, password: str, area_code="31") -> None:
-        """
-        Perform a new login.
-        :param email: Account e-mail
-        :param password: Account password
-        :param area_code: Seems to need to be the phone country code associated with the account, e.g. "31" for NL
-        """
+        dev_id = binascii.b2a_hex(os.urandom(16)).decode('utf-8')
         data = self._post_json("/auth/basic/app/login", {
             "areaCode": area_code,
             "phoneOrEmail": email,
             "password": hashlib.md5(password.encode('utf-8')).hexdigest(),
-            "deviceId": binascii.b2a_hex(os.urandom(16)).decode('utf-8')
+            "deviceId": dev_id
         }, with_auth=False)
         self.cache['email'] = email
         self.cache['token'] = data.get('token')
@@ -106,29 +91,12 @@ class HomgarApi:
         self.cache['refresh_token'] = data.get('refreshToken')
 
     def get_homes(self) -> List[HomgarHome]:
-        """
-        Retrieves all HomgarHome objects associated with the logged in account.
-        Requires first logging in.
-        :return: List of HomgarHome objects
-        """
         data = self._get_json("/app/member/appHome/list")
         return [HomgarHome(hid=h.get('hid'), name=h.get('homeName')) for h in data]
 
     def get_devices_for_hid(self, hid: str) -> List[HomgarHubDevice]:
-        """
-        Retrieves a device tree associated with the home identified by the given hid (home ID).
-        This function returns a list of hubs associated with the home. Each hub contains associated
-        subdevices that use the hub as gateway.
-        :param hid: The home ID to retrieve hubs and associated subdevices for
-        :return: List of hubs with associated subdevicse
-        """
         data = self._get_json("/app/device/getDeviceByHid", params={"hid": str(hid)})
         hubs = []
-
-        logger.debug("=== RAW DEVICE TREE FOR HID %s ===", hid)
-        logger.debug(json.dumps(data, indent=2))
-
-
         def device_base_props(dev_data):
             return dict(
                 model=dev_data.get('model'),
@@ -140,542 +108,164 @@ class HomgarApi:
                 port_number=dev_data.get('portNumber'),
                 alerts=dev_data.get('alerts'),
             )
-
         def get_device_class(dev_data):
             model_code = dev_data.get('modelCode')
-            if model_code not in MODEL_CODE_MAPPING:
-                logger.warning("Unknown device '%s' with modelCode %d", dev_data.get('model'), model_code)
-                return None
-            return MODEL_CODE_MAPPING[model_code]
+            return MODEL_CODE_MAPPING.get(model_code)
 
         for hub_data in data:
-            logger.debug(
-                "HUB FOUND: name=%s model=%s modelCode=%s did=%s",
-                hub_data.get("deviceName"),
-                hub_data.get("model"),
-                hub_data.get("modelCode"),
-                hub_data.get("did")
-            )
-
-            hub_did = hub_data.get("did")  # 🔑 DID réel du hub
-
             subdevices = []
-            for subdevice_data in hub_data.get('subDevices', []):
-                logger.debug(
-                    "  SUBDEVICE FOUND: name=%s model=%s modelCode=%s did=%s",
-                    subdevice_data.get("name"),
-                    subdevice_data.get("model"),
-                    subdevice_data.get("modelCode"),
-                    subdevice_data.get("did")
-                )
-
-                did = subdevice_data.get('did')
-
-                # ⚠️ Correction HomGar : le subdevice météo a did = "0"
-                if str(did) == "0":
-                    logger.debug(
-                        "  SUBDEVICE '%s' has did=0 → binding to hub did=%s",
-                        subdevice_data.get("name"),
-                        hub_did
-                    )
-                    subdevice_data = dict(subdevice_data)  # copie pour ne pas polluer l'original
-                    subdevice_data["did"] = hub_did
-
-                # Ancien cas spécial (hub display), on ne change pas
-                if did == 1:
-                    continue
-
-                subdevice_class = get_device_class(subdevice_data)
-                if subdevice_class is None:
-                    continue
-
-                # Create subdevice with additional hub information for control
-                subdevice_props = device_base_props(subdevice_data)
-                subdevice_props['hub_device_name'] = hub_data.get('deviceName')
-                subdevice_props['hub_product_key'] = hub_data.get('productKey')
-
-                subdevices.append(subdevice_class(**subdevice_props))
-
-            hub_class = get_device_class(hub_data)
-            if hub_class is None:
-                hub_class = HomgarHubDevice
-
-            # Create hub device with additional attributes for MQTT subscription
+            for sub_data in hub_data.get('subDevices', []):
+                sub_cls = get_device_class(sub_data)
+                if sub_cls:
+                    props = device_base_props(sub_data)
+                    props.update({'hub_device_name': hub_data.get('deviceName'), 'hub_product_key': hub_data.get('productKey')})
+                    subdevices.append(sub_cls(**props))
+            hub_cls = get_device_class(hub_data) or HomgarHubDevice
             hub_props = device_base_props(hub_data)
-            hub_props['hub_device_name'] = hub_data.get('deviceName')
-            hub_props['hub_product_key'] = hub_data.get('productKey')
-
-            hubs.append(
-                hub_class(
-                    **hub_props,
-                    subdevices=subdevices
-                )
-            )
-
+            hub_props.update({'hub_device_name': hub_data.get('deviceName'), 'hub_product_key': hub_data.get('productKey')})
+            hubs.append(hub_cls(**hub_props, subdevices=subdevices))
         return hubs
 
     def get_device_status(self, hub: HomgarHubDevice) -> None:
-        """
-        Updates the device status of all subdevices associated with the given hub device.
-        :param hub: The hub to update
-        """
         data = self._get_json("/app/device/getDeviceStatus", params={"mid": str(hub.mid)})
-        id_map = {status_id: device for device in [hub, *hub.subdevices] for status_id in device.get_device_status_ids()}
-
-        for subdevice_status in data['subDeviceStatus']:
-            device = id_map.get(subdevice_status['id'])
-            if device is not None:
-                device.set_device_status(subdevice_status)
+        id_map = {sid: dev for dev in [hub, *hub.subdevices] for sid in dev.get_device_status_ids()}
+        for status in data.get('subDeviceStatus', []):
+            dev_id = status.get('id')
+            device = id_map.get(dev_id)
+            if device:
+                device.set_device_status(status)
 
     def control_device_work_mode(self, device_name: str, product_key: str, mid: str, addr: int, port: int, mode: int, duration: int = 0) -> dict:
-        """
-        Controls the work mode of a device (e.g., irrigation timer).
-        
-        :param device_name: Device name (e.g., "MAC-XXXXXXXXXXXX")
-        :param product_key: Product key
-        :param mid: Device MID
-        :param addr: Device address
-        :param port: Port/zone number (1-3 for DiivooWT11W)
-        :param mode: 0 = OFF, 1 = ON
-        :param duration: Duration in seconds (0 for indefinite)
-        :return: API response data
-        """
+        self._api_cmd_counter += 1
+        seq = self._api_cmd_counter
+        logger.info("MQTT-CMD: Outbound #%d | Zone %d | Mode %d", seq, port, mode)
         return self._post_json("/app/device/controlWorkMode", {
-            "deviceName": device_name,
-            "productKey": product_key,
-            "mid": str(mid),
-            "addr": addr,
-            "port": port,
-            "mode": mode,
-            "duration": duration,
-            "param": ""
+            "deviceName": device_name, "productKey": product_key, "mid": str(mid),
+            "addr": addr, "port": port, "mode": mode, "duration": duration, "param": str(seq)
         })
 
     def ensure_logged_in(self, email: str, password: str, area_code: str = "31") -> None:
-        """
-        Ensures this API object has valid credentials.
-        Attempts to verify the token stored in the auth cache. If invalid, attempts to login.
-        See login() for parameter info.
-        """
-        if (
-                self.cache.get('email') != email or
-                datetime.fromtimestamp(self.cache.get('token_expires', 0)) - datetime.utcnow() < timedelta(minutes=60)
-        ):
-            self.login(email, password, area_code=area_code)
+        exp = self.cache.get('token_expires', 0)
+        if self.cache.get('email') != email or (datetime.fromtimestamp(exp) - datetime.utcnow() < timedelta(minutes=60)):
+            self.login(email, password, area_code)
 
     def subscribe_to_device_status(self, hid: str, hid_list: List[str], devices: List[dict]) -> Optional[dict]:
-        """
-        Subscribe to real-time device status updates via MQTT.
-        
-        :param hid: Primary home ID
-        :param hid_list: List of all home IDs
-        :param devices: List of device dictionaries with deviceName, mid, productKey
-        :return: MQTT connection details or None if failed
-        """
-        logger.info("Starting device status subscription for HID: %s, devices: %d", hid, len(devices))
-        if mqtt is None:
-            logger.error("MQTT not available, install paho-mqtt package")
-            return None
-            
-        device_id = str(uuid.uuid4()).replace('-', '')[:20]
-        logger.debug("Generated device ID for subscription: %s", device_id)
-        
-        subscribe_data = {
-            "hid": hid,
-            "hidList": hid_list,
-            "subscribe": devices,
-            "unsubscribe": [],
+        if mqtt is None: return None
+        device_id = binascii.b2a_hex(os.urandom(10)).decode('utf-8')
+        sub_body = {
+            "hid": hid, "hidList": hid_list, "subscribe": devices, "unsubscribe": [],
             "userInfo": {
-                "deviceName": device_id,
-                "deviceType": 1,
-                "notice": 0,
-                "productKey": self._get_push_product_key(),
-                "pushId": str(uuid.uuid4()).replace('-', '')
+                "deviceName": device_id, "deviceType": 1, "notice": 0,
+                "productKey": self._get_push_product_key(), "pushId": str(uuid.uuid4()).replace('-', '')
             }
         }
-        
         try:
-            logger.debug("Sending subscription request to API")
-            response = self._post_json("/app/device/subscribeStatus", subscribe_data)
-            logger.debug("Subscription API response: %s", response)
-            self.subscription_data = response
-            # Store subscription parameters for renewal
-            self._subscription_devices = devices
-            self._subscription_hids = hid_list
-            mqtt_host = response.get('mqttHostUrl')
-            if mqtt_host:
-                logger.info("MQTT subscription successful, broker: %s", mqtt_host)
-            else:
-                logger.warning("MQTT subscription response missing mqttHostUrl")
-            return response
+            logger.info("Requesting MQTT credentials for HID: %s", hid)
+            self.subscription_data = self._post_json("/app/device/subscribeStatus", sub_body)
+            self._subscription_devices, self._subscription_hids = devices, hid_list
+            logger.info("[DEBUG] [API HTTP RECV] Status: 200 | URL: %s/app/device/subscribeStatus", self.base)
+            return self.subscription_data
         except Exception as e:
-            logger.error("Failed to subscribe to device status: %s", e)
+            logger.error("MQTT Subscription failure: %s", e)
             return None
 
     def connect_mqtt(self, callback: Optional[Callable] = None) -> bool:
-        """
-        Connect to MQTT broker using subscription data.
-        
-        :param callback: Optional callback function for status updates
-        :return: True if connection successful
-        """
-        logger.info("Starting MQTT connection")
-        if not self.subscription_data:
-            logger.error("No subscription data available for MQTT connection")
-            return False
-            
-        if mqtt is None:
-            logger.error("MQTT library not available")
-            return False
-            
-        logger.debug("Subscription data available: %s", list(self.subscription_data.keys()) if self.subscription_data else None)
-        logger.debug("Required fields in subscription data: mqttHostUrl=%s, deviceName=%s, productKey=%s, deviceSecret=%s", 
-                    self.subscription_data.get('mqttHostUrl'), 
-                    self.subscription_data.get('deviceName'),
-                    self.subscription_data.get('productKey'),
-                    "***" if self.subscription_data.get('deviceSecret') else None)
-            
-        if callback:
-            self.status_callbacks.append(callback)
-            logger.debug("Added status callback (total callbacks: %d)", len(self.status_callbacks))
-            
+        if not self.subscription_data or mqtt is None: return False
+        if callback: self.status_callbacks.append(callback)
         with self._mqtt_lock:
-            if self.mqtt_client and self.mqtt_connected:
-                logger.debug("MQTT already connected")
-                return True
-                
+            if self.mqtt_client and self.mqtt_connected: return True
             try:
-                logger.debug("Creating MQTT client")
-                self.mqtt_client = mqtt.Client()
-                self.mqtt_client.on_connect = self._on_mqtt_connect
-                self.mqtt_client.on_message = self._on_mqtt_message
-                self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
+                c = self.subscription_data
+                dn, pk, ds = c.get('deviceName'), c.get('productKey'), c.get('deviceSecret')
+                client_id = f"{dn}|securemode=3,signmethod=hmacsha1|"
+                username = f"{dn}&{pk}"
+                sign_content = f"clientId{dn}deviceName{dn}productKey{pk}"
+                password = hmac.new(ds.encode('utf-8'), sign_content.encode('utf-8'), hashlib.sha1).hexdigest().upper()
+
+                self.mqtt_client = mqtt.Client(client_id=client_id, clean_session=True, protocol=mqtt.MQTTv311)
+                self.mqtt_client.on_connect, self.mqtt_client.on_message = self._on_mqtt_connect, self._on_mqtt_message
+                self.mqtt_client.on_disconnect, self.mqtt_client.on_log = self._on_mqtt_disconnect, self._on_mqtt_log
+                self.mqtt_client.on_subscribe = self._on_mqtt_subscribe
                 
-                # Set credentials
-                device_name = self.subscription_data.get('deviceName')
-                product_key = self.subscription_data.get('productKey')
-                device_secret = self.subscription_data.get('deviceSecret')
+                self.mqtt_client.username_pw_set(username, password)
+                self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=60)
+                self.mqtt_client.loop_start()
                 
-                logger.debug("MQTT credentials - deviceName: %s, productKey: %s, deviceSecret: %s", 
-                           device_name, product_key, "***" if device_secret else None)
-                
-                if device_name and product_key and device_secret:
-                    username = f"{device_name}&{product_key}"
-                    password = device_secret
-                    logger.debug("Setting MQTT credentials with username: %s", username)
-                    self.mqtt_client.username_pw_set(username, password)
-                    logger.debug("MQTT credentials set successfully")
-                else:
-                    logger.error("Missing MQTT credentials: deviceName=%s, productKey=%s, deviceSecret=%s", 
-                               device_name, product_key, "***" if device_secret else None)
-                
-                # Connect to broker
-                mqtt_url = self.subscription_data.get('mqttHostUrl', '')
-                logger.debug("MQTT broker URL from subscription: %s", mqtt_url)
-                
-                if ':' in mqtt_url:
-                    host, port = mqtt_url.split(':')
-                    port = int(port)
-                else:
-                    host = mqtt_url
-                    port = 1883
-                    
-                logger.info("Attempting to connect to MQTT broker at %s:%d", host, port)
-                
-                try:
-                    self.mqtt_client.connect(host, port, 60)
-                    logger.debug("MQTT connect() call succeeded, starting loop")
-                    self.mqtt_client.loop_start()
-                    logger.debug("MQTT loop started successfully")
-                    return True
-                except Exception as connect_error:
-                    logger.error("MQTT connection failed: %s", connect_error)
-                    return False
-                
+                h, p = c.get('mqttHostUrl').split(':') if ':' in c.get('mqttHostUrl') else (c.get('mqttHostUrl'), 1883)
+                logger.info("[DIAG] [MQTT-SIGN] Sending Signed Connect to %s", h)
+                self.mqtt_client.connect(h, int(p), keepalive=60)
+                return True
             except Exception as e:
-                logger.error("Failed to connect to MQTT: %s", e)
+                logger.error("MQTT Connection Exception: %s", e)
                 return False
 
     def _on_mqtt_connect(self, client, userdata, flags, rc):
-        """MQTT connection callback"""
-        logger.info("MQTT connection callback triggered with code: %s", rc)
-        
         if rc == 0:
-            logger.info("MQTT connected successfully")
             self.mqtt_connected = True
+            pk = self.subscription_data.get('productKey')
+            dn = self.subscription_data.get('deviceName')
             
-            # Subscribe to device status topics
-            product_key = self.subscription_data.get('productKey')
-            device_name = self.subscription_data.get('deviceName')
+            # These topics use the specific Aliyun hierarchy for your Hub and its Sub-devices
+            topics = [
+                (f"/sys/{pk}/{dn}/thing/event/property/post", 0),
+                (f"/sys/{pk}/{dn}/thing/service/property/set", 0),
+                (f"/sys/{pk}/{dn}/thing/status/update", 0),
+                (f"/sys/{pk}/{dn}/thing/event/+/post", 0),
+                (f"/sys/{pk}/{dn}/thing/event/property/post_reply", 0),
+                (f"/sys/{pk}/{dn}/thing/event/property/batch/post", 0),
+                (f"/sys/{pk}/{dn}/thing/sub/status/update", 0),
+                (f"/sys/{pk}/{dn}/thing/sub/event/property/post", 0),
+                (f"/sys/{pk}/{dn}/thing/service/+/reply", 0)
+            ]
             
-            logger.debug("Preparing to subscribe with productKey: %s, deviceName: %s", product_key, device_name)
-            
-            if product_key and device_name:
-                topic = f"/{product_key}/{device_name}/user/status"
-                logger.debug("Subscribing to MQTT topic: %s", topic)
-                result = client.subscribe(topic)
-                logger.info("MQTT subscription result: %s for topic: %s", result, topic)
-            else:
-                logger.error("Cannot subscribe to MQTT topic: missing productKey or deviceName")
+            client.subscribe(topics)
+            logger.info("[DIAG] [MQTT-INTERNAL] Sending SUBSCRIBE %s", topics)
+            logger.info("MQTT: SUCCESS - Connected. Listening for Hub/Sub-device commands and telemetry.")
         else:
-            error_messages = {
-                1: "Connection refused - incorrect protocol version",
-                2: "Connection refused - invalid client identifier",
-                3: "Connection refused - server unavailable",
-                4: "Connection refused - bad username or password",
-                5: "Connection refused - not authorised"
-            }
-            error_msg = error_messages.get(rc, f"Unknown error code {rc}")
-            logger.error("MQTT connection failed with code %s: %s", rc, error_msg)
             self.mqtt_connected = False
+            logger.error("MQTT: Connection refused code %d", rc)
+
+    def _on_mqtt_subscribe(self, client, userdata, mid, granted_qos):
+        logger.info("[DIAG] [MQTT-SUBACK] MessageID=%d | GrantedQoS=%s", mid, granted_qos)
+
+    def _on_mqtt_log(self, client, userdata, level, buf):
+        logger.info("[DIAG] [MQTT-INTERNAL] %s", buf)
 
     def _on_mqtt_message(self, client, userdata, msg):
-        """MQTT message callback"""
-        logger.debug("MQTT message callback triggered")
+        self._mqtt_msg_counter += 1
+        seq = self._mqtt_msg_counter
         try:
-            topic = msg.topic
             payload = msg.payload.decode('utf-8')
-            logger.info("=== MQTT MESSAGE RECEIVED ===")
-            logger.info("Topic: %s", topic)
-            logger.info("Raw payload: %s", payload)
-            logger.info("Payload length: %d bytes", len(payload))
-            logger.info("Payload hex: %s", payload.encode('utf-8').hex())
-            
-            # Try to parse as JSON
-            try:
-                data = json.loads(payload)
-                logger.info("Successfully parsed as JSON:")
-                logger.info("JSON structure: %s", json.dumps(data, indent=2))
-                
-                # Log detailed analysis of the JSON structure
-                self._analyze_mqtt_json_message(data)
-                
-                # Call status callbacks
-                logger.debug("Calling %d status callbacks with parsed data", len(self.status_callbacks))
-                for i, callback in enumerate(self.status_callbacks):
-                    try:
-                        logger.debug("Executing callback %d", i)
-                        callback(data)
-                        logger.debug("Callback %d executed successfully", i)
-                    except Exception as callback_error:
-                        logger.error("Error in callback %d: %s", i, callback_error)
-                        
-            except json.JSONDecodeError as json_error:
-                logger.warning("Failed to parse as JSON: %s", json_error)
-                logger.info("Attempting alternative parsing methods...")
-                
-                # Try to parse as other formats
-                self._analyze_non_json_mqtt_message(payload)
-                
-            logger.info("=== END MQTT MESSAGE ===")
-                
+            logger.info("[DIAG] [MQTT-INTERNAL] Received PUBLISH (d0, q0, r0, m0), '%s', ...  (%d bytes)", msg.topic, len(payload))
+            logger.info("MQTT: Real-time update #%d received on topic: %s", seq, msg.topic)
+            data = json.loads(payload)
+            data['_seq'] = seq
+            for cb in self.status_callbacks:
+                try: cb(data)
+                except Exception as e: logger.error("Callback Error: %s", e)
         except Exception as e:
-            logger.error("Error processing MQTT message: %s", e)
-    
-    def _analyze_mqtt_json_message(self, data):
-        """Analyze and log detailed information about JSON MQTT messages"""
-        logger.info("MQTT JSON Analysis:")
-        
-        # Check for common fields
-        if isinstance(data, dict):
-            logger.info("Message type: Dictionary with %d keys", len(data))
-            for key, value in data.items():
-                logger.info("  Key '%s': %s (type: %s)", key, str(value)[:100], type(value).__name__)
-                
-                # Special handling for known fields
-                if key == 'deviceId' or key == 'mid':
-                    logger.info("    → Device identifier found: %s", value)
-                elif key == 'status' or key == 'state':
-                    logger.info("    → Device status/state found: %s", value)
-                elif key == 'timestamp':
-                    logger.info("    → Timestamp found: %s", value)
-                elif key == 'data' and isinstance(value, dict):
-                    logger.info("    → Nested data object with keys: %s", list(value.keys()))
-                    
-        elif isinstance(data, list):
-            logger.info("Message type: List with %d items", len(data))
-            for i, item in enumerate(data[:5]):  # Log first 5 items
-                logger.info("  Item %d: %s (type: %s)", i, str(item)[:100], type(item).__name__)
-        else:
-            logger.info("Message type: %s, value: %s", type(data).__name__, str(data)[:200])
-    
-    def _analyze_non_json_mqtt_message(self, payload):
-        """Analyze non-JSON MQTT messages"""
-        logger.info("Non-JSON MQTT Analysis:")
-        logger.info("Raw string: %s", payload)
-        
-        # Check for common patterns
-        if payload.startswith('11#'):
-            logger.info("  → Appears to be hex-encoded device status (starts with '11#')")
-            hex_part = payload[3:]  # Remove '11#' prefix
-            logger.info("  → Hex data: %s", hex_part)
-            logger.info("  → Hex length: %d characters", len(hex_part))
-            
-            # Try to parse hex patterns
-            self._analyze_hex_device_status(hex_part)
-            
-        elif ',' in payload:
-            logger.info("  → Contains commas, might be CSV format")
-            parts = payload.split(',')
-            logger.info("  → %d parts: %s", len(parts), parts)
-            
-        elif ';' in payload:
-            logger.info("  → Contains semicolons, might be semicolon-separated format")
-            parts = payload.split(';')
-            logger.info("  → %d parts: %s", len(parts), parts)
-            
-        elif '|' in payload:
-            logger.info("  → Contains pipes, might be pipe-separated format")
-            parts = payload.split('|')
-            logger.info("  → %d parts: %s", len(parts), parts)
-            
-        else:
-            logger.info("  → Unknown format, analyzing character patterns")
-            logger.info("  → Contains digits: %s", any(c.isdigit() for c in payload))
-            logger.info("  → Contains alpha: %s", any(c.isalpha() for c in payload))
-            logger.info("  → Contains uppercase: %s", any(c.isupper() for c in payload))
-            logger.info("  → Contains lowercase: %s", any(c.islower() for c in payload))
-    
-    def _analyze_hex_device_status(self, hex_data):
-        """Analyze hex-encoded device status data"""
-        logger.info("Hex Device Status Analysis:")
-        logger.info("Full hex string: %s", hex_data)
-        
-        # Look for known patterns based on DiivooWT11W parsing
-        patterns = {
-            '19D8': 'Port 1 status pattern',
-            '1AD8': 'Port 2 status pattern', 
-            '1BD8': 'Port 3 status pattern',
-            '21B7': 'Port 1 timer pattern',
-            '22B7': 'Port 2 timer pattern',
-            '23B7': 'Port 3 timer pattern',
-            '25AD': 'Port 1 duration pattern',
-            '26AD': 'Port 2 duration pattern',
-            '27AD': 'Port 3 duration pattern',
-        }
-        
-        found_patterns = []
-        for pattern, description in patterns.items():
-            pos = hex_data.find(pattern)
-            if pos >= 0:
-                found_patterns.append((pattern, description, pos))
-                logger.info("  → Found %s at position %d", description, pos)
-                
-                # Extract the full pattern with data
-                if pos + 6 <= len(hex_data):
-                    full_pattern = hex_data[pos:pos + 6]
-                    logger.info("    Full pattern: %s", full_pattern)
-                    
-                    # For status patterns, decode the status
-                    if 'status' in description:
-                        status_code = full_pattern[2:]  # Last 4 chars
-                        status_meanings = {
-                            'D821': 'ON',
-                            'D820': 'OFF (Recent)',
-                            'D800': 'OFF (Idle)'
-                        }
-                        if status_code in status_meanings:
-                            logger.info("    Status meaning: %s", status_meanings[status_code])
-                    
-                    # For timer patterns, extract timer value
-                    elif 'timer' in description and pos + 12 <= len(hex_data):
-                        timer_hex = hex_data[pos + 4:pos + 12]  # 8 hex chars after pattern
-                        try:
-                            timer_value = int(timer_hex, 16)
-                            logger.info("    Timer value: %d seconds", timer_value)
-                        except ValueError:
-                            logger.info("    Timer hex: %s (could not convert)", timer_hex)
-                    
-                    # For duration patterns
-                    elif 'duration' in description and pos + 8 <= len(hex_data):
-                        duration_hex = hex_data[pos + 4:pos + 8]  # 4 hex chars after pattern
-                        try:
-                            duration_value = int(duration_hex, 16)
-                            logger.info("    Duration value: %d", duration_value)
-                        except ValueError:
-                            logger.info("    Duration hex: %s (could not convert)", duration_hex)
-        
-        if not found_patterns:
-            logger.info("  → No known patterns found, raw hex analysis:")
-            # Break into chunks for easier reading
-            chunk_size = 8
-            for i in range(0, len(hex_data), chunk_size):
-                chunk = hex_data[i:i + chunk_size]
-                logger.info("    Chunk %d: %s", i // chunk_size, chunk)
+            logger.error("MQTT Message Error: %s", e)
 
     def _on_mqtt_disconnect(self, client, userdata, rc):
-        """MQTT disconnect callback"""
-        if rc == 0:
-            logger.info("MQTT disconnected cleanly (code %s)", rc)
-        else:
-            logger.debug("MQTT disconnected unexpectedly with code %s", rc)
         self.mqtt_connected = False
+        logger.warning("[DIAG] [MQTT-DISCONN] RC=%d | Time=%s", rc, time.strftime("%H:%M:%S"))
+        if rc != 0: logger.warning("MQTT: Connection lost. Reconnecting...")
 
     def disconnect_mqtt(self):
-        """Disconnect from MQTT broker"""
-        logger.info("Disconnecting from MQTT broker")
         with self._mqtt_lock:
             if self.mqtt_client:
-                logger.debug("Stopping MQTT loop")
+                logger.info("[DIAG] [MQTT-STOP] Shutting down client and loop.")
                 self.mqtt_client.loop_stop()
-                logger.debug("Disconnecting MQTT client")
                 self.mqtt_client.disconnect()
                 self.mqtt_client = None
                 self.mqtt_connected = False
-                logger.info("MQTT disconnected and cleaned up")
-            else:
-                logger.debug("No MQTT client to disconnect")
-
-    def add_status_callback(self, callback: Callable):
-        """Add a callback for device status updates"""
-        if callback not in self.status_callbacks:
-            self.status_callbacks.append(callback)
-
-    def remove_status_callback(self, callback: Callable):
-        """Remove a callback for device status updates"""
-        if callback in self.status_callbacks:
-            self.status_callbacks.remove(callback)
 
     def is_subscription_expired(self) -> bool:
-        """Check if MQTT subscription is expired or about to expire."""
-        if not self.subscription_data:
-            return True
-            
-        expire_timestamp = self.subscription_data.get('expire')
-        if not expire_timestamp:
-            return True
-            
-        # Check if subscription expires in the next 5 minutes (300 seconds)
-        current_time = datetime.utcnow().timestamp() * 1000  # Convert to milliseconds
-        time_until_expiry = expire_timestamp - current_time
-        
-        return time_until_expiry <= 300000  # 5 minutes in milliseconds
+        if not self.subscription_data: return True
+        exp = self.subscription_data.get('expire', 0)
+        return (exp - int(time.time() * 1000)) <= 300000
 
     def renew_subscription(self) -> bool:
-        """Renew the MQTT subscription if it's expired or about to expire."""
-        if not self.is_subscription_expired():
-            return True
-            
-        if not self._subscription_devices or not self._subscription_hids:
-            logger.warning("Cannot renew subscription: missing device or HID data")
-            return False
-            
-        logger.info("Renewing MQTT subscription")
-        
-        # Disconnect existing MQTT connection
+        if not self.is_subscription_expired(): return True
         self.disconnect_mqtt()
-        
-        # Re-subscribe with stored parameters
-        primary_hid = self._subscription_hids[0]
-        result = self.subscribe_to_device_status(
-            primary_hid,
-            self._subscription_hids,
-            self._subscription_devices
-        )
-        
-        if result:
-            logger.info("MQTT subscription renewed successfully")
-            return True
-        else:
-            logger.error("Failed to renew MQTT subscription")
-            return False
+        return bool(self.subscribe_to_device_status(self._subscription_hids[0], self._subscription_hids, self._subscription_devices))

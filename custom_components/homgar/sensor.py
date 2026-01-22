@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -14,49 +15,35 @@ from homeassistant.const import (
     PERCENTAGE,
     UnitOfPressure,
     UnitOfTemperature,
-    UnitOfTime,
     UnitOfLength,
-    LIGHT_LUX,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import HomgarConfigEntry
 from .const import (
-    DOMAIN,
     ICON_TEMPERATURE,
     ICON_HUMIDITY,
     ICON_PRESSURE,
     ICON_SOIL_MOISTURE,
-    ICON_LIGHT,
-    ICON_RAINFALL,
     ICON_ZONE_STATUS,
-    ICON_COUNTDOWN_TIMER,
-    ICON_DURATION_SETTING,
-    ZONE_STATUS_ON,
-    ZONE_STATUS_OFF_RECENT,
-    ZONE_STATUS_OFF_IDLE,
+    ICON_AIR_SENSOR,
+    ICON_RAIN_SENSOR,
+    ICON_RAINFALL,
 )
 from .coordinator import HomgarDataUpdateCoordinator
 from .devices import (
     RainPointDisplayHub,
     RainPointSoilMoistureSensor,
-    RainPointRainSensor,
     RainPointAirSensor,
-    DiivooWT11W,
-    HWG0538WRF,
-    HomgarWeatherHub,
-    HomgarWeatherStation,
-    HomgarIndoorSensor,
+    RainPointRainSensor,
+    HTV405FRF,
 )
 from .entity import HomgarEntity
 
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
-
-from datetime import datetime
-
 _LOGGER = logging.getLogger(__name__)
 
+# Base sensor descriptions
 SENSOR_DESCRIPTIONS = {
     "temperature": SensorEntityDescription(
         key="temperature",
@@ -78,7 +65,7 @@ SENSOR_DESCRIPTIONS = {
         key="pressure",
         name="Pressure",
         device_class=SensorDeviceClass.PRESSURE,
-        native_unit_of_measurement=UnitOfPressure.HPA,
+        native_unit_of_measurement=UnitOfPressure.PA,
         state_class=SensorStateClass.MEASUREMENT,
         icon=ICON_PRESSURE,
     ),
@@ -89,14 +76,6 @@ SENSOR_DESCRIPTIONS = {
         native_unit_of_measurement=PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon=ICON_SOIL_MOISTURE,
-    ),
-    "light": SensorEntityDescription(
-        key="light",
-        name="Light",
-        device_class=SensorDeviceClass.ILLUMINANCE,
-        native_unit_of_measurement=LIGHT_LUX,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon=ICON_LIGHT,
     ),
     "rainfall": SensorEntityDescription(
         key="rainfall",
@@ -111,19 +90,6 @@ SENSOR_DESCRIPTIONS = {
         name="Zone Status",
         icon=ICON_ZONE_STATUS,
     ),
-    "countdown_timer": SensorEntityDescription(
-        key="countdown_timer",
-        name="Countdown Timer",
-        device_class=SensorDeviceClass.DURATION,
-        native_unit_of_measurement=UnitOfTime.SECONDS,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon=ICON_COUNTDOWN_TIMER,
-    ),
-    "duration_setting": SensorEntityDescription(
-        key="duration_setting",
-        name="Duration Setting",
-        icon=ICON_DURATION_SETTING,
-    ),
 }
 
 
@@ -134,19 +100,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up HomGar sensors from a config entry."""
     coordinator = config_entry.runtime_data
+    _LOGGER.info("[DEBUG] [Sensor Setup] Initializing sensors for %d devices", len(coordinator.devices))
 
     entities = []
 
-    # Create sensors for each device
     for device_id, device in coordinator.devices.items():
-
         if isinstance(device, RainPointDisplayHub):
-            entities.extend([
-                HomgarTemperatureSensor(coordinator, device_id, device),
-                HomgarHumiditySensor(coordinator, device_id, device),
-                HomgarPressureSensor(coordinator, device_id, device),
-            ])
-        elif isinstance(device, HomgarWeatherStation):
             entities.extend([
                 HomgarTemperatureSensor(coordinator, device_id, device),
                 HomgarHumiditySensor(coordinator, device_id, device),
@@ -156,39 +115,26 @@ async def async_setup_entry(
             entities.extend([
                 HomgarSoilMoistureSensor(coordinator, device_id, device),
                 HomgarSoilTemperatureSensor(coordinator, device_id, device),
-                HomgarLightSensor(coordinator, device_id, device),
-            ])
-        elif isinstance(device, RainPointRainSensor):
-            entities.extend([
-                HomgarRainfallTotalSensor(coordinator, device_id, device),
-                HomgarRainfallHourlySensor(coordinator, device_id, device),
-                HomgarRainfallDailySensor(coordinator, device_id, device),
             ])
         elif isinstance(device, RainPointAirSensor):
             entities.extend([
                 HomgarAirTemperatureSensor(coordinator, device_id, device),
                 HomgarAirHumiditySensor(coordinator, device_id, device),
             ])
-        elif isinstance(device, HomgarIndoorSensor):
-            entities.extend([
-                HomgarAirTemperatureSensor(coordinator, device_id, device),
-                HomgarAirHumiditySensor(coordinator, device_id, device),
-            ])
-        elif isinstance(device, DiivooWT11W):
-            for zone in [1, 2, 3]:
-                entities.extend([
-                    HomgarZoneStatusSensor(coordinator, device_id, device, zone),
-                    HomgarCountdownTimerSensor(coordinator, device_id, device, zone),
-                    HomgarDurationSettingSensor(coordinator, device_id, device, zone),
-                ])
+        elif isinstance(device, RainPointRainSensor):
+            entities.append(HomgarRainfallSensor(coordinator, device_id, device))
+        elif isinstance(device, HTV405FRF):
+            for zone in [1, 2, 3, 4]:
+                entities.append(
+                    HomgarZoneStatusSensor(coordinator, device_id, device, zone)
+                )
 
+    _LOGGER.info("[DEBUG] [Sensor Setup] Adding %d sensor entities to HA", len(entities))
     async_add_entities(entities)
 
 
-class HomgarSensor(CoordinatorEntity, SensorEntity):
-    """Base class for HomGar sensors."""
-
-    _attr_force_update = True  # 🔥 C'EST ÇA LA CLÉ
+class HomgarSensor(HomgarEntity, SensorEntity):
+    """Base class for all HomGar sensors."""
 
     def __init__(
         self,
@@ -198,259 +144,116 @@ class HomgarSensor(CoordinatorEntity, SensorEntity):
         description: SensorEntityDescription,
         zone: int | None = None,
     ) -> None:
-        super().__init__(coordinator)
-
-        self.device_id = device_id
+        """Initialize the base sensor."""
+        super().__init__(coordinator, device_id, device)
         self.entity_description = description
         self.zone = zone
-
-        base_uid = f"homgar_{device.did}_{getattr(device, 'sid', device.address)}"
-
+        
         if zone is not None:
             self._attr_name = f"{device.name} Zone {zone} {description.name}"
-            self._attr_unique_id = f"{base_uid}_zone_{zone}_{description.key}"
+            self._attr_unique_id = f"{device.mid}_{device.address}_zone_{zone}_{description.key}"
         else:
             self._attr_name = f"{device.name} {description.name}"
-            self._attr_unique_id = f"{base_uid}_{description.key}"
+            self._attr_unique_id = f"{device.mid}_{device.address}_{description.key}"
 
-    @property
-    def device(self) -> Any | None:
-        dev = self.coordinator.data.get(self.device_id)
-        _LOGGER.debug(
-            "HA DEVICE ACCESS %s -> %s temp=%s",
-            self.entity_id,
-            self.device_id,
-            getattr(dev, "temp_mk_current", None),
-        )
-        return dev
-
-    def _handle_coordinator_update(self) -> None:
-        _LOGGER.debug(
-            "HA UPDATE %s (%s)",
-            self.entity_id,
-            self.device_id,
-        )
-        self.async_write_ha_state()
-
-    @property
-    def extra_state_attributes(self):
-        return {
-            "last_update": datetime.utcnow().isoformat()
-        }
 
 class HomgarTemperatureSensor(HomgarSensor):
-    """Temperature sensor for Display Hub."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["temperature"],
-        )
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the temperature value."""
-        if hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
-            return round(self.device.temp_mk_current * 1e-3 - 273.15, 1)
-        return None
-
-
-class HomgarHumiditySensor(HomgarSensor):
-    """Humidity sensor for Display Hub."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["humidity"],
-        )
-
-    @property
-    def native_value(self) -> int | None:
-        """Return the humidity value."""
-        return getattr(self.device, 'hum_current', None)
-
-
-class HomgarPressureSensor(HomgarSensor):
-    """Pressure sensor for Display Hub."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["pressure"],
-        )
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the pressure value in hPa."""
-        p = getattr(self.device, "press_pa_current", None)
-        return p / 10 if p is not None else None
-
-
-class HomgarSoilMoistureSensor(HomgarSensor):
-    """Soil moisture sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["soil_moisture"],
-        )
-
-    @property
-    def native_value(self) -> int | None:
-        """Return the soil moisture value."""
-        return getattr(self.device, 'moist_percent_current', None)
-
-
-class HomgarSoilTemperatureSensor(HomgarSensor):
-    """Soil temperature sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["temperature"],
-        )
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the soil temperature value."""
-        if hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
-            return round(self.device.temp_mk_current * 1e-3 - 273.15, 1)
-        return None
-
-
-class HomgarLightSensor(HomgarSensor):
-    """Light sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        super().__init__(
-            coordinator,
-            device_id,
-            device,
-            SENSOR_DESCRIPTIONS["light"],
-        )
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the light value."""
-        return getattr(self.device, 'light_lux_current', None)
-
-class HomgarRainfallTotalSensor(HomgarSensor):
-    """Total rainfall sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        desc = SENSOR_DESCRIPTIONS["rainfall"]
-        desc.name = "Total Rainfall"
-        super().__init__(coordinator, device_id, device, desc)
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the total rainfall value."""
-        return getattr(self.device, 'rainfall_mm_total', None)
-
-
-class HomgarRainfallHourlySensor(HomgarSensor):
-    """Hourly rainfall sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        desc = SENSOR_DESCRIPTIONS["rainfall"]
-        desc.name = "Hourly Rainfall"
-        super().__init__(coordinator, device_id, device, desc)
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the hourly rainfall value."""
-        return getattr(self.device, 'rainfall_mm_hour', None)
-
-
-class HomgarRainfallDailySensor(HomgarSensor):
-    """Daily rainfall sensor."""
-
-    def __init__(self, coordinator, device_id, device):
-        desc = SENSOR_DESCRIPTIONS["rainfall"]
-        desc.name = "Daily Rainfall"
-        super().__init__(coordinator, device_id, device, desc)
-
-    @property
-    def native_value(self) -> float | None:
-        """Return the daily rainfall value."""
-        return getattr(self.device, 'rainfall_mm_daily', None)
-
-
-class HomgarAirTemperatureSensor(HomgarSensor):
-    """Air temperature sensor."""
-
+    """Ambient temperature sensor."""
     def __init__(self, coordinator, device_id, device):
         super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["temperature"])
 
     @property
     def native_value(self) -> float | None:
-        """Return the air temperature value."""
-        if hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
+        if self.device and hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
             return round(self.device.temp_mk_current * 1e-3 - 273.15, 1)
         return None
 
 
-class HomgarAirHumiditySensor(HomgarSensor):
-    """Air humidity sensor."""
-
+class HomgarHumiditySensor(HomgarSensor):
+    """Ambient humidity sensor."""
     def __init__(self, coordinator, device_id, device):
         super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["humidity"])
 
     @property
     def native_value(self) -> int | None:
-        """Return the air humidity value."""
         return getattr(self.device, 'hum_current', None)
 
 
-class HomgarZoneStatusSensor(HomgarSensor):
-    """Zone status sensor for irrigation timers."""
+class HomgarPressureSensor(HomgarSensor):
+    """Atmospheric pressure sensor."""
+    def __init__(self, coordinator, device_id, device):
+        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["pressure"])
 
+    @property
+    def native_value(self) -> int | None:
+        return getattr(self.device, 'press_pa_current', None)
+
+
+class HomgarSoilMoistureSensor(HomgarSensor):
+    """Soil moisture sensor."""
+    def __init__(self, coordinator, device_id, device):
+        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["soil_moisture"])
+
+    @property
+    def native_value(self) -> int | None:
+        return getattr(self.device, 'moist_percent_current', None)
+
+
+class HomgarSoilTemperatureSensor(HomgarSensor):
+    """Soil temperature sensor."""
+    def __init__(self, coordinator, device_id, device):
+        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["temperature"])
+
+    @property
+    def native_value(self) -> float | None:
+        if self.device and hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
+            return round(self.device.temp_mk_current * 1e-3 - 273.15, 1)
+        return None
+
+
+class HomgarAirTemperatureSensor(HomgarSensor):
+    """Air temperature sensor with weather icon fix."""
+    def __init__(self, coordinator, device_id, device):
+        # FIX: Use replace() for frozen dataclass
+        new_desc = replace(SENSOR_DESCRIPTIONS["temperature"], icon=ICON_AIR_SENSOR)
+        super().__init__(coordinator, device_id, device, new_desc)
+
+    @property
+    def native_value(self) -> float | None:
+        if self.device and hasattr(self.device, 'temp_mk_current') and self.device.temp_mk_current:
+            return round(self.device.temp_mk_current * 1e-3 - 273.15, 1)
+        return None
+
+
+class HomgarAirHumiditySensor(HomgarSensor):
+    """Air humidity sensor with weather icon fix."""
+    def __init__(self, coordinator, device_id, device):
+        # FIX: Use replace() for frozen dataclass
+        new_desc = replace(SENSOR_DESCRIPTIONS["humidity"], icon=ICON_AIR_SENSOR)
+        super().__init__(coordinator, device_id, device, new_desc)
+
+    @property
+    def native_value(self) -> int | None:
+        return getattr(self.device, 'hum_current', None)
+
+
+class HomgarRainfallSensor(HomgarSensor):
+    """Rainfall sensor."""
+    def __init__(self, coordinator, device_id, device):
+        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["rainfall"])
+
+    @property
+    def native_value(self) -> float | None:
+        return getattr(self.device, 'rainfall_current', None)
+
+
+class HomgarZoneStatusSensor(HomgarSensor):
+    """Status sensor (On/Off/Idle) for irrigation zones."""
     def __init__(self, coordinator, device_id, device, zone):
         super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["zone_status"], zone)
 
     @property
     def native_value(self) -> str | None:
-        """Return the zone status."""
-        zone_status = self.device.get_zone_status(self.zone)
-        if zone_status:
-            status_map = {
-                ZONE_STATUS_ON: "On",
-                ZONE_STATUS_OFF_RECENT: "Off (Recent)",
-                ZONE_STATUS_OFF_IDLE: "Off (Idle)",
-            }
-            return status_map.get(zone_status["status"], zone_status["status"])
+        if self.device and hasattr(self.device, 'get_zone_status_text'):
+            return self.device.get_zone_status_text(self.zone)
         return None
-
-
-class HomgarCountdownTimerSensor(HomgarSensor):
-    """Countdown timer sensor for irrigation timers."""
-
-    def __init__(self, coordinator, device_id, device, zone):
-        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["countdown_timer"], zone)
-
-    @property
-    def native_value(self) -> int | None:
-        """Return the countdown timer value."""
-        return self.device.get_zone_countdown_timer(self.zone)
-
-
-class HomgarDurationSettingSensor(HomgarSensor):
-    """Duration setting sensor for irrigation timers."""
-
-    def __init__(self, coordinator, device_id, device, zone):
-        super().__init__(coordinator, device_id, device, SENSOR_DESCRIPTIONS["duration_setting"], zone)
-
-    @property
-    def native_value(self) -> int | None:
-        """Return the duration setting value."""
-        return self.device.get_zone_duration_setting(self.zone)
