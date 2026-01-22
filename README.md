@@ -2,45 +2,23 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 
-Home Assistant integration for HomGar / RainPoint / Diivoo devices.
+Home Assistant integration for HomGar / RainPoint 
 
 This project is forked from Remboooo/homgarapi and adapted for Home Assistant usage.
 
----
-
-## ⚠️ Important Notice (HomGar Weather Stations)
-
-This fork extends the original integration to properly support **HomGar weather stations with RF sub-devices**, including:
-
-- Weather hub (modelCode **257**)
-- Embedded weather station (modelCode **85**)
-- Multiple indoor RF sensors (modelCode **86**)
-
-These devices expose **hierarchical data structures** that were not fully handled in the original implementation.
-
----
-
 ## ✨ What’s New in This Fork
 
-### ✅ Proper HomGar Weather Station Support
+### ✅ Fixed MQTT connection
+### ✅ Support for a new hub HWG023WBRF-V2
+### ✅ Support for Soil Sensors: HCS026FRF
+### ✅ Support for Air Sensors: HCS014ARF
+### ✅ Support for Rain Sensors: HCS012ARF
+### ✅ Support for 4 Zone valve timer: HTV405FRF
+### ✅ Added a debug logs including when a new device or not recognised device is detected
 
-HomGar weather setups consist of:
-- **One hub (modelCode 257)** – gateway only, no sensor data
-- **One embedded weather station (modelCode 85)** – temperature, humidity, pressure
-- **Multiple indoor sensors (modelCode 86)** – temperature & humidity only
+TODO:
 
-This fork introduces:
-- Clear separation between **hub** and **sensor roles**
-- Correct parsing of `D01` payloads
-- No duplicate entities
-- Stable unique IDs
+Confirm that the MQTT is only for configuration changes.
+I could not obtain a version to be able to receive the device / sensor update status from MQTT. This is done via 30 seconds HTTP POLL, but at least MQTT is stable.
 
-### 🧠 Correct Data Mapping
-
-| Model | Role | Sensors |
-|-----|-----|--------|
-| 257 | Weather Hub | Connectivity only |
-| 85 | Weather Station | Temperature, Humidity, Pressure |
-| 86 | Indoor Sensor | Temperature, Humidity |
-
-Pressure values are correctly parsed from payloads such as:
+As usual you need to create a second homgar user in the homgar app and add it as a memeber. Then use it for the HA integration as the API does not allow 2 connections from the single username at the sane time
