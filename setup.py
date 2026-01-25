@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="homgar-homeassistant",
+    name="homgar-homeassistant-v2",
     version="2.0.0",
     description="Home Assistant integration for HomGar irrigation devices (forked from Remboooo/homgarapi)",
     long_description=open("README.md").read(),
