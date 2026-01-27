@@ -28,7 +28,7 @@ from .coordinator import HomgarDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-type HomgarConfigEntry = ConfigEntry[HomgarDataUpdateCoordinator]
+#type HomgarConfigEntry = ConfigEntry[HomgarDataUpdateCoordinator]
 
 # Service schemas
 SERVICE_START_IRRIGATION_SCHEMA = vol.Schema({
