@@ -31,7 +31,7 @@ A refined Home Assistant integration for the **HomGar / RainPoint** ecosystem. T
 ### Option 1: HACS (Recommended)
 1.  Ensure **HACS** is installed and configured in your Home Assistant instance.
 2.  Navigate to **HACS** > **Integrations** > **Three dots (top right)** > **Custom Repositories**.
-3.  Paste this repository URL and select **Integration** as the category.
+3.  Paste this repository URL and select **Integration** as the category. https://github.com/kitsuneb2/homgar-homeassistant_v2
 4.  Search for **HomGar v2**, click **Download**, and restart Home Assistant.
 
 ### Option 2: Manual
