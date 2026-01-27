@@ -164,11 +164,16 @@ async def async_setup_entry(
 
     for device_id, device in coordinator.devices.items():
         if isinstance(device, RainPointDisplayHub):
-            entities.extend([
-                HomgarTemperatureSensor(coordinator, device_id, device),
-                HomgarHumiditySensor(coordinator, device_id, device),
-                HomgarPressureSensor(coordinator, device_id, device),
-            ])
+            # Only add sensors if the specific data exists on the device
+            if getattr(device, "temp_mk_current", None) is not None:
+                entities.append(HomgarTemperatureSensor(coordinator, device_id, device))
+            
+            if getattr(device, "hum_current", None) is not None:
+                entities.append(HomgarHumiditySensor(coordinator, device_id, device))
+                
+            if getattr(device, "press_pa_current", None) is not None:
+                entities.append(HomgarPressureSensor(coordinator, device_id, device))
+
         elif isinstance(device, RainPointSoilMoistureSensor):
             entities.append(
                 HomgarSoilMoistureSensor(coordinator, device_id, device)
