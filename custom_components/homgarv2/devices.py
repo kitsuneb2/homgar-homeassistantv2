@@ -167,6 +167,8 @@ class RainPointRainSensor(HomgarSubDevice):
     def _parse_device_specific_status_d_value(self, s):
         if "10#" in s:
             hex_part = s.split('#')[1]
+            # This line below is what prints the HEX to your logs
+            #logger.info("[DEBUG] Raw HEX received: %s", hex_part)
             try:
                 # Little Endian Helper: Swaps bytes and divides by 10
                 def get_le_val(start):
@@ -181,9 +183,9 @@ class RainPointRainSensor(HomgarSubDevice):
                 # Index 36: 1202 (Total/7d) -> 53.0
                 
                 self.rain_hour   = get_le_val(2)   # Hourly
-                self.rain_24h    = get_le_val(14)  # MOVED from 10 to 14
+                self.rain_24h    = get_le_val(18)  # MOVED from 10 to 14
                 self.rain_7d     = get_le_val(26)  # 7-Day
-                self.rain_total  = get_le_val(38)  # MOVED from 36 to 38 for alignment
+                self.rain_total  = get_le_val(36)  # MOVED from 36 to 38 for alignment
 
                 logger.info("[DEBUG] [RAIN] 1h:%.1f, 24h:%.1f, 7d:%.1f, Tot:%.1f", 
                             self.rain_hour, self.rain_24h, self.rain_7d, self.rain_total)
